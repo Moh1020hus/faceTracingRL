@@ -1,82 +1,110 @@
+import os
+import sys
+
 import cv2
 import face_recognition
-import numpy as np
+
+REFERENCE_IMAGE = os.environ.get("REFERENCE_IMAGE", "me.jpg")
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+SCALE = 0.25  # Detect on a quarter-size frame, then map boxes back to full res.
+TOLERANCE = 0.6
 
 
-print("Loading reference face...")
-my_image = face_recognition.load_image_file("me.jpg")
-my_encoding = face_recognition.face_encodings(my_image)[0]
+def load_reference_encoding(path):
+    if not os.path.exists(path):
+        sys.exit(f"Reference image not found: {path}")
+
+    image = face_recognition.load_image_file(path)
+    encodings = face_recognition.face_encodings(image)
+    if not encodings:
+        # Indexing [0] here used to raise a bare IndexError.
+        sys.exit(f"No face found in {path}. Use a clear, front-facing photo.")
+    if len(encodings) > 1:
+        print(f"Warning: {len(encodings)} faces in {path}, using the first one.")
+    return encodings[0]
 
 
-video_capture = cv2.VideoCapture(0)
+def main():
+    print("Loading reference face...")
+    my_encoding = load_reference_encoding(REFERENCE_IMAGE)
 
-print("Vision System Active. Looking for YOU...")
+    video_capture = cv2.VideoCapture(CAMERA_INDEX)
+    if not video_capture.isOpened():
+        sys.exit(f"Could not open camera {CAMERA_INDEX}.")
 
-while True:
-    #  GET FRAME
-    ret, frame = video_capture.read()
-    if not ret: break
-    
-    # Scale down for speed 
-    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+    print("Vision System Active. Looking for YOU...")
+    inv_scale = int(1 / SCALE)
 
-   
-    face_locations = face_recognition.face_locations(rgb_small_frame)
-    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+    try:
+        while True:
+            ret, frame = video_capture.read()
+            if not ret:
+                print("Camera returned no frame - stopping.")
+                break
 
-    target_found = False
-    
-    
-    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-        
-        
-        matches = face_recognition.compare_faces([my_encoding], face_encoding, tolerance=0.6)
-        face_distance = face_recognition.face_distance([my_encoding], face_encoding)
-        
-        
-        top *= 4; right *= 4; bottom *= 4; left *= 4
+            small_frame = cv2.resize(frame, (0, 0), fx=SCALE, fy=SCALE)
+            # face_recognition needs a contiguous RGB array; cvtColor gives one.
+            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-        if matches[0]:
-           
-            target_found = True
-            
-            
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-            cv2.putText(frame, f"TARGET (Dist: {face_distance[0]:.2f})", (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            
-            # Calculate center of the face
-            center_x = (left + right) / 2
-            center_y = (top + bottom) / 2
-            
-            # Calculate Error (0.0 is center, -1.0 is left, 1.0 is right)
-            height, width, _ = frame.shape
-            error_x = (center_x - (width / 2)) / (width / 2)
-            error_y = (center_y - (height / 2)) / (height / 2)
-            
-            # Calculate Area (Distance)
-            face_area = (bottom - top) * (right - left)
-            area_norm = face_area / (width * height)
-            
-            print(f"SENDING TO DRONE -> ErrorX: {error_x:.2f}, ErrorY: {error_y:.2f}, Area: {area_norm:.2f}")
-            
-            
-            
-        else:
-            
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-            cv2.putText(frame, "Unknown", (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            face_locations = face_recognition.face_locations(rgb_small_frame)
+            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-    #
-    if not target_found:
-        print("Target Lost - Hovering...")
+            target_found = False
+            height, width = frame.shape[:2]
 
-    
-    cv2.imshow('Drone Vision', frame)
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                distance = face_recognition.face_distance([my_encoding], face_encoding)[0]
+                is_target = distance <= TOLERANCE
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                # Scale the box back up to the full-resolution frame.
+                top *= inv_scale
+                right *= inv_scale
+                bottom *= inv_scale
+                left *= inv_scale
 
-video_capture.release()
-cv2.destroyAllWindows()
+                if is_target:
+                    target_found = True
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(
+                        frame, f"TARGET (Dist: {distance:.2f})", (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                    )
+
+                    center_x = (left + right) / 2
+                    center_y = (top + bottom) / 2
+
+                    # Error is 0.0 at frame center, -1.0 at the left/top edge.
+                    error_x = (center_x - (width / 2)) / (width / 2)
+                    error_y = (center_y - (height / 2)) / (height / 2)
+
+                    face_area = (bottom - top) * (right - left)
+                    area_norm = face_area / (width * height)
+
+                    print(
+                        f"SENDING TO DRONE -> ErrorX: {error_x:.2f}, "
+                        f"ErrorY: {error_y:.2f}, Area: {area_norm:.2f}"
+                    )
+                else:
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+                    cv2.putText(
+                        frame, "Unknown", (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+                    )
+
+            if not target_found:
+                print("Target Lost - Hovering...")
+
+            cv2.imshow("Drone Vision", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        # Ran only on the clean exit path before, so a crash held the camera open.
+        video_capture.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
